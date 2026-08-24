@@ -1,18 +1,23 @@
 # Work schedule, resume context
 
 ```state
-stage: built, not yet committed or deployed
-next: get permission to commit and push the first branch, then wait for the infrastructure credentials
-blocked: the bootstrap apply is Julian's to run. The only credentials here are root keys for account 230345688874, and nothing applies to Amazon Web Services from the sandbox
-prs: none yet
+stage: three stacked pull requests open, none merged, nothing deployed
+next: raise the GitHub Actions spending limit on atlantic-blue so the Check workflow can run
+blocked: GitHub Actions refuses to start any job on this account, so continuous integration has never run
+blocked: the deploy needs credentials for the account that creates the OpenID Connect role, and they are not on this workspace
+prs:
+  - https://github.com/atlantic-blue/uni-schedule/pull/1
+  - https://github.com/atlantic-blue/uni-schedule/pull/2
+  - https://github.com/atlantic-blue/uni-schedule/pull/3
 steps:
-  - [x] database schema, policies and hours, with tests against a real Postgres
-  - [x] the five screens, running on demo data
-  - [x] continuous integration workflow
-  - [x] deploy workflow and bootstrap Terraform, written, not applied
-  - [ ] commit and push to https://github.com/atlantic-blue/uni-schedule
-  - [ ] bootstrap the Amazon Web Services role, once, run by Julian from his own machine
+  - [x] database schema, policies and hours, tested against a real Postgres (pull request 1)
+  - [x] the five screens, running on demo data (pull request 2)
+  - [x] continuous integration and deploy workflows, plus bootstrap Terraform (pull request 3)
+  - [ ] get continuous integration running at all, then green on all three
+  - [ ] merge bottom up with merge commits
+  - [ ] bootstrap the Amazon Web Services role, once, with infrastructure credentials
   - [ ] first deploy, then open the site and read what it says
+  - [ ] open the app in a browser and look at it, which has never been done
   - [ ] answer the six domain questions and correct the assumptions below
 ```
 
@@ -66,11 +71,16 @@ one is cheap to change and each one is written down where it lives.
   It is not the guarantee. `tests/rls.test.ts` is, and a mutation of one policy
   was seen to turn it red.
 
-## Not done
+## Not done, and worth knowing before trusting any of this
 
 - Nobody has run this against a real Supabase project. The Supabase
-  implementation is typed and built but never executed against the service.
-- No screenshot of the running app yet.
+  implementation is typed, built and never executed against the service.
+- Nobody has opened the app in a browser. Chromium would not install in the
+  sandbox it was built in. The tests drive the real components in a simulated
+  document, and the built bundle serves over HTTP, which is a weaker claim.
+- Continuous integration has never run. The workflow is written and the account
+  refuses to start a job, saying the spending limit needs raising. Every gate was
+  run locally instead, in a clean checkout of each commit on its own.
 - Adding and removing people is done in the Supabase dashboard, not in the app.
 - There is no notification when a shift is near.
 
