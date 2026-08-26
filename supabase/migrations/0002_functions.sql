@@ -1,27 +1,39 @@
--- Reads the caller's role without going through row level security, so a policy
--- on profiles can call it without asking profiles a question that calls itself.
-create function public.is_admin() returns boolean
+-- ── who is asking ────────────────────────────────────────────────────────────
+
+create function public.is_supervisor() returns boolean
   language sql stable security definer set search_path = public as $$
   select exists (
     select 1 from public.profiles
-    where id = auth.uid() and role = 'admin' and active
+    where id = auth.uid() and role = 'supervisor' and status = 'approved'
   );
 $$;
 
-create function public.current_role_of_caller() returns public.person_role
+create function public.current_person_id() returns uuid
   language sql stable security definer set search_path = public as $$
-  select role from public.profiles where id = auth.uid();
+  select person_id from public.profiles where id = auth.uid();
 $$;
 
--- Every new sign in gets a profile. The name falls back to the address, because a
--- guest invited by link may never have typed one.
+-- A new sign in makes an account. Somebody asking to be a supervisor waits for an
+-- existing supervisor to approve them. Everybody else is approved at once.
+-- The account links itself to a person record when the name matches one exactly.
 create function public.handle_new_user() returns trigger
   language plpgsql security definer set search_path = public as $$
+declare
+  wanted text := btrim(coalesce(new.raw_user_meta_data ->> 'requested_role', 'student'));
+  shown  text := coalesce(nullif(btrim(new.raw_user_meta_data ->> 'full_name'), ''),
+                          split_part(new.email, '@', 1));
+  found  uuid;
 begin
-  insert into public.profiles (id, full_name)
+  select id into found from public.people
+  where lower(btrim(first_name || ' ' || last_name)) = lower(shown)
+    and not exists (select 1 from public.profiles where person_id = people.id)
+  limit 1;
+
+  insert into public.profiles (id, person_id, display_name, role, status)
   values (
-    new.id,
-    coalesce(nullif(btrim(new.raw_user_meta_data ->> 'full_name'), ''), split_part(new.email, '@', 1))
+    new.id, found, shown,
+    case when wanted = 'supervisor' then 'supervisor' else 'student' end::public.account_role,
+    case when wanted = 'supervisor' then 'pending'    else 'approved' end::public.account_status
   )
   on conflict (id) do nothing;
   return new;
@@ -32,103 +44,184 @@ create trigger on_auth_user_created
   after insert on auth.users
   for each row execute function public.handle_new_user();
 
-create function public.shift_minutes(p_shift_id uuid) returns integer
-  language sql stable as $$
-  select (extract(epoch from (ends_at - starts_at)) / 60)::integer
-  from public.shifts where id = p_shift_id;
+-- ── the calendar rules ───────────────────────────────────────────────────────
+
+-- The last Sunday in a month. Daylight saving changes on these two dates, and
+-- the Friday afternoon is half an hour shorter in winter because of it.
+create function public.last_sunday(p_year integer, p_month integer) returns date
+  language sql immutable as $$
+  select last_day - extract(dow from last_day)::integer
+  from (select (make_date(p_year, p_month, 1) + interval '1 month - 1 day')::date as last_day) m;
 $$;
 
--- Marking attendance credits the full shift for 'worked' and for 'excused', and
--- nothing for 'absent'. An excused absence still counts, which is the rule the
--- paper sheet used. Change the 'excused' branch here if your rule differs.
-create function public.default_credit(p_shift_id uuid, p_status public.attendance_status)
-  returns integer language sql stable as $$
-  select case p_status
-    when 'worked'  then public.shift_minutes(p_shift_id)
-    when 'excused' then public.shift_minutes(p_shift_id)
-    else 0
+create function public.is_summer(p_day date) returns boolean
+  language sql immutable as $$
+  select p_day >= public.last_sunday(extract(year from p_day)::integer, 3)
+     and p_day <  public.last_sunday(extract(year from p_day)::integer, 10);
+$$;
+
+-- The work afternoons are Tuesday and Friday. Another day is still allowed, and
+-- the screens warn about it, exactly as the old system did.
+create function public.is_work_day(p_day date) returns boolean
+  language sql immutable as $$
+  select extract(dow from p_day)::integer in (2, 5);
+$$;
+
+-- Tuesday is three hours. Friday is three in summer and two and a half in winter.
+-- Any other day is three. The supervisor can always overrule the suggestion.
+create function public.default_duration(p_day date) returns numeric
+  language sql immutable as $$
+  select case
+    when extract(dow from p_day)::integer = 5 and not public.is_summer(p_day) then 2.5
+    else 3
   end;
 $$;
 
--- Fills one week from the templates. Returns how many shifts it created. Running
--- it twice on the same week creates nothing the second time.
-create function public.generate_week(p_monday date) returns integer
-  language plpgsql as $$
-declare
-  created integer;
-begin
-  if extract(isodow from p_monday) <> 1 then
-    raise exception 'generate_week expects a Monday, got %', p_monday;
-  end if;
-
-  with made as (
-    insert into public.shifts (area_id, shift_date, starts_at, ends_at, places)
-    select t.area_id, p_monday + (t.weekday - 1), t.starts_at, t.ends_at, t.places
-    from public.shift_templates t
-    join public.areas a on a.id = t.area_id and a.active
-    on conflict (area_id, shift_date, starts_at) do nothing
-    returning 1
-  )
-  select count(*) into created from made;
-
-  return created;
-end;
+create function public.falls_on_birthday(p_person uuid, p_day date) returns boolean
+  language sql stable as $$
+  select exists (
+    select 1 from public.people
+    where id = p_person
+      and birthday is not null
+      and extract(month from birthday) = extract(month from p_day)
+      and extract(day   from birthday) = extract(day   from p_day)
+  );
 $$;
 
--- Hours for one person: what the shifts credited, plus corrections, against the
--- target. A negative balance is what the paper sheet calls minus hours.
-create view public.hours_balance with (security_invoker = true) as
-select
-  p.id                                                as person_id,
-  p.full_name,
-  p.role,
-  (p.target_hours * 60)::integer                      as target_minutes,
-  coalesce(worked.minutes, 0)                         as credited_minutes,
-  coalesce(fixed.minutes, 0)                          as adjustment_minutes,
-  coalesce(worked.minutes, 0) + coalesce(fixed.minutes, 0) - (p.target_hours * 60)::integer
-                                                      as balance_minutes,
-  greatest(0, (p.target_hours * 60)::integer - coalesce(worked.minutes, 0) - coalesce(fixed.minutes, 0))
-                                                      as minus_minutes,
-  coalesce(worked.excused_days, 0)                    as excused_days
-from public.profiles p
-left join lateral (
-  select sum(at.credited_minutes)::integer as minutes,
-         count(*) filter (where at.status = 'excused')::integer as excused_days
-  from public.attendance at
-  join public.assignments asg on asg.id = at.assignment_id
-  where asg.person_id = p.id
-) worked on true
-left join lateral (
-  select sum(adj.minutes)::integer as minutes
-  from public.adjustments adj where adj.person_id = p.id
-) fixed on true
-where public.is_admin() or p.id = auth.uid();
+-- ── what an entry is worth ───────────────────────────────────────────────────
 
--- The credit is decided in one place. A client sends the status and leaves the
--- minutes empty, so the browser can never disagree with the database about what
--- a shift was worth. An administrator may still send a number to override it.
-create function public.fill_credit() returns trigger language plpgsql as $$
-declare
-  target_shift uuid;
+-- Everything the browser is not allowed to decide happens here, so the screens
+-- and the database can never disagree about a day.
+create function public.shape_entry() returns trigger
+  language plpgsql as $$
 begin
-  select shift_id into target_shift from public.assignments where id = new.assignment_id;
-
-  if new.credited_minutes is null then
-    new.credited_minutes := public.default_credit(target_shift, new.status);
-  elsif tg_op = 'UPDATE'
-    and new.status is distinct from old.status
-    and new.credited_minutes = old.credited_minutes
-  then
-    -- The status changed and no new number came with it. That is what a
-    -- correction from the app looks like, because it sends the status alone. The
-    -- old number has to go, or a shift marked worked and then corrected to
-    -- missed would keep its four hours.
-    new.credited_minutes := public.default_credit(target_shift, new.status);
+  if new.present then
+    if new.duration_hours is null then
+      new.duration_hours := public.default_duration(new.entry_date);
+    end if;
+    new.excused := false;
+    new.reason := null;
+    new.is_birthday := false;
+  else
+    new.duration_hours := 0;
+    new.punctual := null;
+    -- Absent on your own birthday is excused, and the reason is fixed.
+    if public.falls_on_birthday(new.person_id, new.entry_date) then
+      new.is_birthday := true;
+      new.excused := true;
+      new.reason := 'Birthday';
+    else
+      new.is_birthday := false;
+    end if;
   end if;
   return new;
 end;
 $$;
 
-create trigger attendance_credit
-  before insert or update on public.attendance
-  for each row execute function public.fill_credit();
+create trigger entries_shaped
+  before insert or update on public.attendance_entries
+  for each row execute function public.shape_entry();
+
+-- A reason a supervisor types is offered back to them next time. Birthday is set
+-- by the rule above, so it never joins the list.
+create function public.learn_reason() returns trigger
+  language plpgsql security definer set search_path = public as $$
+begin
+  if not new.present and new.excused
+     and coalesce(btrim(new.reason), '') <> '' and new.reason <> 'Birthday' then
+    insert into public.absence_reasons (reason) values (btrim(new.reason))
+    on conflict (reason) do nothing;
+  end if;
+  return new;
+end;
+$$;
+
+create trigger entries_teach_reasons
+  after insert or update on public.attendance_entries
+  for each row execute function public.learn_reason();
+
+-- ── moving people between areas ──────────────────────────────────────────────
+
+-- A person stands on one area at a time. The first person placed on an empty
+-- area leads it, and removing a lead promotes whoever is left.
+create function public.leave_area(p_person uuid) returns void
+  language plpgsql as $$
+declare
+  old_area uuid;
+  was_lead boolean;
+begin
+  select area_id, is_area_lead into old_area, was_lead
+  from public.people where id = p_person;
+
+  update public.people
+  set area_id = null, is_area_lead = false, task_detail = null
+  where id = p_person;
+
+  if was_lead and old_area is not null then
+    update public.people set is_area_lead = true
+    where id = (
+      select id from public.people
+      where area_id = old_area and active
+      order by last_name, first_name
+      limit 1
+    );
+  end if;
+end;
+$$;
+
+create function public.place_on_area(p_person uuid, p_area uuid) returns void
+  language plpgsql as $$
+declare
+  area_is_empty boolean;
+begin
+  perform public.leave_area(p_person);
+  select not exists (select 1 from public.people where area_id = p_area)
+  into area_is_empty;
+
+  update public.people
+  set area_id = p_area, group_type = 'shared', is_area_lead = area_is_empty
+  where id = p_person;
+end;
+$$;
+
+create function public.make_area_lead(p_person uuid) returns void
+  language plpgsql as $$
+declare
+  the_area uuid;
+begin
+  select area_id into the_area from public.people where id = p_person;
+  if the_area is null then
+    raise exception 'that person is not on an area, so they cannot lead one';
+  end if;
+  update public.people set is_area_lead = false where area_id = the_area;
+  update public.people set is_area_lead = true  where id = p_person;
+end;
+$$;
+
+-- ── the three numbers ────────────────────────────────────────────────────────
+
+-- Total hours is the hours worked. Minus hours is a COUNT of days missed without
+-- an excuse, which is what the old system means by the phrase. The balance is
+-- the hours against the target, and it is a different number from the minus.
+create view public.person_balance with (security_invoker = true) as
+select
+  p.id                                as person_id,
+  p.first_name,
+  p.last_name,
+  p.target_hours,
+  coalesce(counted.total_hours, 0)    as total_hours,
+  coalesce(counted.minus_count, 0)    as minus_count,
+  coalesce(counted.excused_count, 0)  as excused_count,
+  coalesce(counted.late_count, 0)     as late_count,
+  round(coalesce(counted.total_hours, 0) - p.target_hours) as balance_hours
+from public.people p
+left join lateral (
+  select
+    sum(e.duration_hours) filter (where e.present)                      as total_hours,
+    count(*) filter (where not e.present and not e.excused)::integer    as minus_count,
+    count(*) filter (where not e.present and e.excused)::integer        as excused_count,
+    count(*) filter (where e.present and not e.punctual)::integer       as late_count
+  from public.attendance_entries e
+  where e.person_id = p.id
+) counted on true
+where public.is_supervisor() or p.id = public.current_person_id();
