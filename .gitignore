@@ -28,3 +28,6 @@ dist-ssr
 *.tfstate
 *.tfstate.*
 crash.log
+
+# The client's own documents. The repository is public, so they stay out of it.
+reference/
