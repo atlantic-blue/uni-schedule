@@ -1,0 +1,73 @@
+@import 'tailwindcss';
+
+@theme {
+  --color-canvas: #f8fafc;
+  --color-surface: #ffffff;
+  --color-line: #e2e8f0;
+  --color-ink: #0f172a;
+  --color-muted: #64748b;
+  --color-accent: #4f46e5;
+  --color-accent-soft: #eef2ff;
+  --color-positive: #047857;
+  --color-warning: #b45309;
+  --color-danger: #b91c1c;
+
+  --radius-control: 0.5rem;
+  --radius-card: 0.75rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  @theme {
+    --color-canvas: #0b1120;
+    --color-surface: #131c31;
+    --color-line: #24314f;
+    --color-ink: #e8edf7;
+    --color-muted: #93a3bd;
+    --color-accent: #8b8cf9;
+    --color-accent-soft: #1e2547;
+    --color-positive: #34d399;
+    --color-warning: #fbbf24;
+    --color-danger: #f87171;
+  }
+}
+
+html {
+  color-scheme: light dark;
+}
+
+body {
+  margin: 0;
+  background: var(--color-canvas);
+  color: var(--color-ink);
+  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Anything a finger presses is at least 44 pixels tall. */
+button,
+[role='button'],
+select,
+input {
+  min-height: 2.75rem;
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+@media print {
+  .no-print { display: none !important; }
+  body { background: #ffffff; color: #000000; }
+  .print-sheet { padding: 0; }
+  @page { margin: 12mm; }
+}
